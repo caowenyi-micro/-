@@ -5,6 +5,9 @@ SpringApplicationRunListener实例化和通过EventPublishingRunListener发布�
 创建ApplicationContext并赋值环境变量和执行ApplicationContextInitializer
 开始刷新applicationContext
 BeanFactoryPostProcessor处理1（除了实例化直接加入的同时也包括BeanDefiniton中的）：BeanDefinitionRegistryPostProcessor向BeanFactory中加入BeanDefinition（包扫描）.其中最重要的ConfigurationClassPostProcessor和MapperScannerConfigurer 一个扫描包一个扫描mapper生成FactoryBean
+ConfigurationClassPostProcessor调用ConfigurationClassParse，其又会调用ComponentScanAnnotationParser处理@ComponnetScan，将basePackages下的被@Component直接或者间接注解的class转化为BeanDefinition
+接着ConfigurationClassParse会处理@Import注解，Import的类，如果实现了DeferredImportSelector接口则将Import类实例化并保存到configurationClasses中，其中比较特殊的AutoConfigurationImportSelector.selectImports方法会加载所有的EnableAutoConfiguration的配置。如果实现了ImportSelector接口递归的调用selectImports，并将产生的类继续进行Import解析，注入到BeanDefinitionMap中。 如果实现的是ImportBeanDefinitionRegistrar接口，则实例化对象，并保存到configurationClasses中。 如果是普通类，则加入configurationClasses中。
+将读取的所有configurationClasses中的类生成BeanDefinition，注入到BeanDefinitionMap中。包括被EnableAutoConfiguration配置的类。
 BeanFactoryPostProcessor处理2（除了实例化直接加入的同时也包括BeanDefiniton中的）：BeanFactoryPostProcessor 主要是处理BeanFactory中已经存在的BeanDefinition或者加入一些单例对象如BeanPostProcessor等
 从BeanFactory中解析出BeanPostProcessor对象并保存到BeanFactory中
 处理applicationEventMulticaster和applicationListener
