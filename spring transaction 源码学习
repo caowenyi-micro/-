@@ -1,0 +1,68 @@
+springboot-transaction的配置：
+在spring中事务配置代码如下：
+<!-- 注册数据源 -->
+<bean id="dataSource" class="...">
+    <property name="" value=""/>
+</bean>
+
+<!-- 注册事务管理器 -->
+<bean id="txManager" class="org.springframework.jdbc.datasource.DataSourceTransactionManager">
+    <property name="dataSource" ref="dataSource" />
+</bean>
+
+<!-- 开启事务注解 -->
+<tx:annotation-driven transaction-manager="txManager" />
+TxNamespaceHandler.init方法中有registerBeanDefinitionParser("annotation-driven", new AnnotationDrivenBeanDefinitionParser());
+分析AnnotationDrivenBeanDefinitionParser：其主要调用的内部类AopAutoProxyConfigurer.configureAutoProxyCreator注入了AnnotationTransactionAttributeSource、TransactionInterceptor、BeanFactoryTransactionAttributeSourceAdvisor三个Bean
+BeanFactoryTransactionAttributeSourceAdvisor是一个advisor(应该由advise.invoke具体的切面逻辑和pointcut组成). 其中注入的AnnotationTransactionAttributeSource提供pointcut信息，而TransactionInterceptor提供advise切面逻辑信息。
+在AopAutoProxyConfigurer.configureAutoProxyCreator的第一行会注入一个InfrastructureAdvisorAutoProxyCreator类，该类实现了BeanPostProcessor接口，会在postProcessAfterInitialization类中通过查找类或者方法实现了@Transaction注解的对象进行创建AOP代理对象。而其使用的就是BeanFactoryTransactionAttributeSourceAdvisor这个advisor，最终在执行的时候会在Transactionlnterceptor类中的invoke方法中完成了整个事务的逻辑。
+事务知识点：默认传播级别PROPAGATION_REQUIRED（如果当前没有事物，则新建一个事物；如果已经存在一个事物，则加入到这个事物中）  默认隔离级别ISOLATION_DEFAULT（使用后端数据库默认的隔离级别）保存点SavePoint（嵌套型事务的外部事务保存点）
+TransactionStatus txStatus = txManager.getTransaction(txDefinition);;  开启了一个事务，如果jdbcTemplate.execute等失败则调用txManager.rollback(txStatus);回滚事务
+26   	DataSource dataSource = getDataSource();
+27         jdbcTemplate = new JdbcTemplate(dataSource);
+28 
+29         // 2、创建物管理器
+30         txManager = new DataSourceTransactionManager();
+31         txManager.setDataSource(dataSource);
+32 
+33         // 3、定义事物属性
+34         txDefinition = new DefaultTransactionDefinition();
+35         txDefinition.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
+36 
+37         // 3、开启事物
+38         TransactionStatus txStatus = txManager.getTransaction(txDefinition);
+39 
+40         // 4、执行业务逻辑
+41         try {
+42             jdbcTemplate.execute(insert_sql);
+43             //int i = 1/0;
+44             jdbcTemplate.execute(insert_sql);
+45             txManager.commit(txStatus);
+46         } catch (DataAccessException e) {
+47             txManager.rollback(txStatus);
+48             e.printStackTrace();
+49         }
+在TransactionInterceptor.invoke中通过TransactionInfo txInfo = createTransactionIfNecessary(tm, txAttr, joinpointIdentification); 创建事务，然后通过反射执行原来的方法，如果出现异常completeTransactionAfterThrowing(txInfo, ex); 进行回滚，成功则commitTransactionAfterReturning(txInfo);进行事务提交。
+事务的创建：
+创建事务是通过调用PlatformTransactionManager.getTransaction。其核心调用doGetTransaction方法创建的，其内部通过ConnectionHolder conHolder =
+    (ConnectionHolder) TransactionSynchronizationManager.getResource(obtainDataSource());来获取一个threadLocal的ConnectionHolder，第一次为空。
+如果第一次则需要调用startTransaction去开启一个事务，（在开启事务的之前会调用 suspend(null) 而该方法会TransactionSynchronizationManager.unbindResource，会将threadLocal以前设置的值remove掉，所以为什么同一线程中的不同事务的sqlSession是不同的，所以一级缓存不能公用）在doBegin中发现事务中没有Connection，因此此时需要去创建一个connection(datasource.getConnection),最后将获取的连接设置到事务对象中，（在此过程中会设置connection的自动提交为false,和隔离级别为事务的隔离级别等），最后会把新获取的事务绑定到当前线程中：TransactionSynchronizationManager.bindResource(getDataSource(), txObject.getConnectionHolder());  所以后面只需要通过dataSource就能获取到该线程分配的connection。mybatis中获取的数据库连接，就是根据 dataSource 从ThreadLocal中获取的，从而保证spring事务框架提供的连接和mybatis中获取的连接都是同一个连接。当所有任务完成后，根据执行情况提交或者回归事务
+如果已经有事务了，1）如果子事务是PROPAGATION_NESTED: 会先创建保存点，在任务执行子任务完成后恢复之前的事务信息和保存点（并且不会挂起原事务）（父事务不会受子事务影响，并且子事务不会提交，由父事务提交）。 2） 如果子事务是PROPAGATION_NEVER，直接报错。3）如果子事务是PROPAGATION_NOT_SUPPORTED，因此不在事务中执行所以不用建立事务的保存点，只有执行完恢复事务的信息和执行即可（会挂起父事务），和PROPAGATION_NESTED的区别是父事务失败该子事务也不会回滚。4）如果是PROPAGATION_NEW，则新建一个子事务，并保存父事务的信息，当子事务提交或者回滚后，再执行父事务的执行，会挂起当前事务。父事务和子事务是完全独立的两个事务（并且父子之间的connection也不相同）。
+事务的回滚：
+默认情况下Spring中的亊务异常处理机制只对RuntimeException和Error两种情况感兴趣，我们可以利用注解方式来改变，例如：@Transactional(propagation = Propagation.REQUIRED, rollbackFor = Exception.class)
+PROPAGATION_REQUIRES_NEW新建的子事务的回滚，不会影响上层事务 
+PROPAGATION_NOT_SUPPORTED会挂起上层事务，该方法在没有事务的情况下运行，运行完了再恢复上层事务的执行
+PROPAGATION_NESTED嵌套是子事务嵌套在父事务中执行，子事务是父事务的一部分，在进入子事务之前，父事务建立一个回滚点，叫save point，然后执行子事务，这个子事务的执行也算是父事务的一部分，然后子事务执行结束，父事务继续执行。重点就在于那个save point。（1）   如果子事务回滚，会发生什么？:父事务会回滚到进入子事务前建立的save point，然后尝试其他的事务或者其他的业务逻辑，父事务之前的操作不会受到影响，更不会自动回滚。  （2）   如果父事务回滚，会发生什么？父事务回滚，子事务也会跟着回滚！为什么呢，因为父事务结束之前，子事务是不会提交的，我们说子事务是父事务的一部分，正是这个道理。（3）   事务的提交，是什么情况？是父事务先提交，然后子事务提交，还是子事务先提交，父事务再提交？答案是第二种情况，还是那句话，子事务是父事务的一部分，由父事务统一提交。
+
+PROPAGATION_REQUIRES_NEW和PROPAGATION_NESTED区别：
+对于已经存在事务的处理过程中，我们看到了很多熟悉的操作，但是，也有些不同的地方，函数中对已经存在的事务处理考虑两种情况。
+（1）PROPAGATION_REQUIRES_NEW表示当前方法必须在它自己的事务里运行，一个新的事务将被启动，而如果有一个事务正在运行的话，则在这个方法运行期间被挂起。而Spring中对于此种传播方式的处理与新事务建立最大的不同点在于使用suspend方法将原事务挂起。 将信息挂起的目的当然是为了在当前事务执行完毕后在将原事务还原。
+（2）PROPAGATION_NESTED表示如果当前正有一个事务在运行中，则该方法应该运行在一个嵌套的事务中，被嵌套的事务可以独立于封装事务进行提交或者回滚，如果封装事务不存在，行为就像PROPAGATION_REQUIRES_NEW。对于嵌入式事务的处理，Spring中主要考虑了两种方式的处理。
+Spring中允许嵌入事务的时候，则首选设置保存点的方式作为异常处理的回滚。
+对于其他方式，比如JTA无法使用保存点的方式，那么处理方式与PROPAGATION_ REQUIRES_NEW相同，而一旦出现异常，则由Spring的事务异常处理机制去完成后续操作。
+对于挂起操作的主要目的是记录原有事务的状态，以便于后续操作对事务的恢复
+
+SqlSession一级缓存和事务挂起的关系：
+事务被挂起则会调用TransactionSynchronizationManager.unbindResource(obtainDataSource()) 该方法会清楚threadLoacl的资源，导致sqlSession不能被同一线程的不同事务公用。
+会挂起事务的传播级别：NOT_SUPPORTED  REQUIRES_NEW  
+不会挂起的传播级别：REQUIRED NESTED
