@@ -44,3 +44,23 @@ mybatis和spring结合
 所以其会调用ImportBeanDefinitionRegistrar的registerBeanDefinitions，而MapperScannerRegistrar就是一个ImportBeanDefinitionRegistrar。其最终会注入一个MapperScannerConfigurer。 而该MapperScannerConfigurer是负责根据mapper接口生成mapperName对应的BeanDefinition(是一个MapperFactoryBean类型的BeanDefinition).
 mysql的SqlSessionFactory是通过配置spring.factories的EnableAutoConfiguration来生成的。因为@EnableAutoCOnfiguration会导入AutoConfigurationImportSelector，该类是一个DeferredImportSelector接口，改接口会被ConfigurationClassPostProcessor中处理从而将spring.factories的EnableAutoConfiguration生成BeanDefinition
 
+
+解决事务方法里面调用this.method方法不带事务的问题
+原因：因为事务方法是通过反射调用的因此传入的this对象是原始对象不是事务增强后的对象，因此在方法内嵌套调用的方法是不带事务的
+方法：不同this去调用，通过拿到代理对象去调用
+
+@Transactional(rollbackFor = Exception.class)
+@Override
+public OperationLog nestTransaction(Long id) {
+    OperationLog operationLog=operationLogMapper.findById(id);
+    return ((OperationLogService)AopContext.currentProxy()).findById(id);
+}
+
+@Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRES_NEW)
+@Override
+public OperationLog findById(Long id) {
+   return operationLogMapper.findById(id);
+}
+propagation = Propagation.REQUIRES_NEW 一级缓存不生效  propagation = Propagation.REQUIRED和propagation = Propagation.NESTED 则继承事务，一级缓存生效
+注意要使用：AopContext需要在配置类上加上注解：@EnableAspectJAutoProxy(proxyTargetClass = true, exposeProxy = true) 使得增强对象会保存到ThreadLocal中。
+
