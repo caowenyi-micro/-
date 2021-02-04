@@ -78,5 +78,5 @@ Spring中允许嵌入事务的时候，则首选设置保存点的方式作为�
 
 SqlSession一级缓存和事务挂起的关系：
 事务被挂起则会调用TransactionSynchronizationManager.unbindResource(obtainDataSource()) 该方法会清除threadLoacl的资源，导致sqlSession不能被同一线程的不同事务公用。
-会挂起事务的传播级别：NOT_SUPPORTED  REQUIRES_NEW  
-不会挂起的传播级别：REQUIRED_NESTED  PROPAGATION_REQUIRED
+会挂起事务的传播级别：NOT_SUPPORTED  REQUIRES_NEW   一级缓存失效
+不会挂起的传播级别：REQUIRED_NESTED  PROPAGATION_REQUIRED  一级缓存生效
