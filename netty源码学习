@@ -1,0 +1,157 @@
+**netty线程模型**
+
+Reactor主从多线程模型中由一组NIO线程(boss)来负责处理新连接的接入，另外一组NIO线程(work)来处理IO读写、编解码、业务逻辑处理等操作。因此它是两个线程池，负责新连接接入的线程池称之为主线程池，负责数据读写、编解码操作的线程池称之为从线程池。<br/>
+实际上大部分情况的模型是：boss线程组只有一个线程负责NioServerSocketChannel的OP_ACCEPT事件（除非支持多个端口的连接，如http/80 https/443), work线程组中每个线程可以负责多个NioSocketChannel的OP_READ事件 <br/>
+
+**netty重要组件**
+
+NioEventLoopGroup它是一个线程数组，它里面包含了一组线程，这些线程后续用来执行客户端的接入、IO数据读写等任务。<br/>
+NioEventLoop，可以简单理解为它是一个线程，多个NioEventLoop合起来就是一个NioEventLoopGroup。<br/>
+Pipeline，它是由ChannelHandlerContext类型的元素组成的一个双向链表，ChannelHandlerContext里面包装了一个ChannelHandler。对于服务端而言，每当有新连接接入时，都会通过Pipeline来传播。这个组件十分重要，在实际工作中，使用Netty实现自己自定义的业务逻辑，就是通过修改Pipeline来实现的<br/>
+
+**NettyServer端启动流程**
+
+**NioServerSocketChannel的初始化：**
+
+给ServerBootstrap的group和childGroup赋值，其中group是用于执行NioServerSocketChannel相关的任务（因为group会从其中取出一个eventLoop去绑定到NioSocketChannel中，然后该NioServerSocketChannel中任务都交给改EventLoop执行），childGroup是用于执行和客户端通信的NioSocketChannel相关的任务（同理也会从childGroup中获取一个EventLoop给NioSocketChannel使用）<br/>
+ServerBootstrap的ChannelFactory初始化：传入NioServerSocketChannel类，然后得到其无参构造函数赋值到ReflectiveChannelFactory中，使得其可以通过constructor.newInstance();实例化。最后会将ReflectiveChannelFactory赋值给ServerBootstrap <br/>
+ServerBootstrap的bind方法：在这个方法中会初始化服务端的channel，注册channel到selector上，然后绑定端口，启动服务端 <br/>
+NioServerSocketChannel初始化（initAndRegister()） <br/>
+根据上面的ChannelFactory构造出NioServerSocketChannel对象  <br/>
+在调用无参的构造函数的会先调用SelectorProvider.openServerSocketChannel去创建一个原生的ServerSocketChannel   <br/>
+然后将ServerSocketChannel和SelectionKey.OP_ACCEPT做为参数传入父类构造函数 <br/>
+在父类构造函数中会先创建NioMessageUnsafe unsafe（服务端后面负责用来接收连接等操作的，并可以直接操作内存）和DefaultChannelPipeline pipeline（后面所有新连接的接入，都需要经过该Pipeline进行传播，此时pipeline中只有 HeadContext和 TailContext），保存ServerSocketChannel和SelectionKey.OP_ACCEPT 到 ch和readInterestOp， 并设置ch为非阻塞模式 <br/>
+将NioServerSocketChannel 和ServerSocket设置到NioServerSocketChannelConfig属性中 <br/>
+此时构造函数执行完成进行NioServerSocketChannel初始化，将ServerBootstrap.option和atts方法传入的参数赋值到NioServerSocketChannel的ChannelConfig和attributes属性中 <br/>
+在NioServerSocketChannel的pipeline中加入匿名的new ChannelInitializer<Channel> ，该匿名类不会立刻执行，此时pipeline结果为 HeadContext->ChannelInitializer->TailContext，同时会保存一个PendingHandlerCallback到pipeline中，等待后续channel被注册的时候，被调用，从而实现执行ChannelInitializer.initChannel，其会将ServerBootstrap.handler中传入的channelhandle加入到pipeline中，并将匿名类自身移除，最终pipeline的形式为HeadContext->ServerBootstrap.handle->TailContext （在注册过程中才会调用）<br/>
+在ChannelInitializer中还会添加一个任务，该任务会添加一个ServerBootstrapAcceptor节点，并且该节点中保存了NioServerSocketChannel 和ServerBootstrap传入的childGroup childHandler childOptions childAttrs，从传入参数可以推断其是用于负责新连接接入时，设置NioChannelSocket相关的属性和向其pipeline中加入channelHandle的。最终NioServerSocketChannel的pipeline如下，HeadContext->自定义的ServerBootstrap.handle->ServerBootstrapAcceptor专门负责新连接的接入->TailContext  （在注册过程中才会调用）<br/>
+
+
+**NioServerSocketChannel的注册和绑定端口过程：**
+
+调用ServerBootstrap.group线程组的register方法进行注册 <br/>
+首先需要轮询的方式从group线程组中选择一个线程负责NioServerSocketChannel的注册（NioEventLoop) [NioEventLoopGroup的源码会单独介绍]  （此时还是在main线程中）<br/>
+在注册之前会先将NioServerSocketChannel和NioEventLoop保存到ChannelPromise中，方便后续获取 （main线程）<br/>
+调用NioServerSocketChannel中的unsafe的register方法将promise和NioEventLoop传递进去 （main线程）<br/>
+会先将NioServerSocketChannel中的eventLoop属性赋值为选择出来的NioEventLoop，然后后续会根据当前线程和eventLoop是否是同一个线程来决定，是否要切换到eventLopp中来执行，此时main线程将会添加ChannelPromise的回调listener来处理ChannelFuture的完成事件，此时主线程阻塞在sync方法，直到服务结束（main线程-基本算已完结）<br/>
+NioEventLoop是一个带队列的单线程对象，其在调用execute的时候，会先把任务加入队列中，如果第一次调用会分配一个线程，然后调用SingleThreadEventExecutor.this.run() ，最终是调用的NioEventLoop的run方法，在该方法中会执行selector的select进行数据的读取和写入，同时也会执行提交到队列中的任务。由于此时还没有注册所以会直接执行注册任务。（NioEventLoop线程）<br/>
+在NioEventLoop线程中完成NioServerSocketChannel.register0的注册，会传入之前的ChannelPromise对象 （NioEventLoop线程-注册任务）<br/>
+NioServerSocketChannel.register0中会通过获取eventLoop中的selector来实现注册的，此时传入的interestOp为0（因为还为初始化完成(未绑定端口)，因此不需要select出感兴趣的key) <br/>
+现在会调用pipeline中的PendingHandlerCallback（在pipeline.addList匿名类ChannelInializer的时候添加的，用于回调ChannelInializer).  （NioEventLoop线程-注册任务）<br/>
+调用ServerBootstap中的匿名类ChannelInializer的initChannel方法，将自定义的channelHandle加入pipeLine并移除ChannelInializer，并向EventLoop队列中加入一个任务用于加入ServerBootstrapAcceptor节点。 此时HeadContext->ServerBootstrap.handle->TailContext （NioEventLoop线程-注册任务）<br/>
+safeSetSuccess：调用上面添加的ChannelPromise完成回调来实现端口的绑定，其实现是向NioEventLoop线程中添加channel.bind任务（NioEventLoop线程-注册任务）<br/>
+调用fireChannelRegistered事件，此时注册任务完成（但还没有完成端口绑定任务）（其会从head往后找对该时间感兴趣的AbstractChannelHandlerContext都会被调用）（NioEventLoop线程-注册任务）<br/>
+调用刚才在ChannelInializer中加入的任务，往pipeline中加入ServerBootstrapAcceptor节点  （NioEventLoop线程-ServerBootstrapAcceptor任务）<br/>
+执行channel.bind任务，其会调用pipeline的tail的bind方法 ，从后往前的调用感兴趣的AbstractChannelHandlerContext的bind方法，最终会由Head的bind方法来实现端口绑定，其最后由NioServerSocketChannel.doBind结束，并向NioEventLoop中添加pipeline.fireChannelActive()事件（NioEventLoop线程-channel.bind任务）<br/>
+从pipeline的head开始执行channelActive方法，当pipeline中的context都处理完该事件后，在head中通过调用channel.read发起pipeline read事件，从tail往前，最后会由head来处理，最终回调用NioServerSocketChannel基类的doBeginRead方法将SelectionKey.OP_ACCEPT设置到selector中，此时终于完成了端口的绑定了可以接收客户端的连接了（NioEventLoop线程-fireChannelActive任务）<br/>
+此时NioEventLoop一直循环中等处理加入的任务或者NioServerSocketChannel的selectedKey事件 <br/>
+
+**NioEventLoopGroup介绍**
+
+children用于保存新建的NioEventLoop对象(children = new EventExecutor[nThreads]) <br/>
+EventExecutorChooserFactory：用于创建EventExecutorChooser，用于决定如何随机从children中选择出一个NioEventLoop，在next()方法中调用。<br/>
+
+**NioEventLoop属性：**
+
+SelectorProvider：这个对象的作用就是创建多路复用器 Selector，通过调用SelectorProvider.provider()创建，最后会保存到NioEventLoop中，最后会通过openSelector创建一个selector，因此每个NioEventLoop的selector都不一样。<br/>
+RejectedExecutionHandlers.reject()：返回的是一个拒绝策略，当向线程池中添加任务时，如果线程池任务队列已满，这个时候任务就会被拒绝，此时线程池就会执行拒绝策略。 但是默认队列的大小是Interger.Max所以基本上用不到<br/>
+Executor：通过ThreadFactory创建一个线程用于执行NioEventLoop.run()方法，当NioEventLoop第一次调用execute的时候，会调用executor中设置的threadFactory创建一个线程，然后在该线程中调用NioEventLoop.run方法，改方法会处理IO事件和提交到NioEventLoop中taskQueue中的任务<br/>
+unwrappedSelector和selector是一样的，应该是之前selector有空循环的问题，但是新版本没有这个问题所以两个没有区别了。但是不同NioEventLoop之间是不同的<br/>
+selectStrategyFactory：选择策略工厂用于创建SelectStrategy，默认策略是NioEventLoop中没有任务的时候会进行selector.select来等待获取网络IO事件，如果有则直接去执行任务。<br/>
+
+**NioServerSocketChannel的NioEventLoop的连接事件过程或者叫NioEventLoop.run()：**
+
+ ioRatio=50 （默认）用于控制当有网络IO事件和任务的时候，来控制执行时间占比。首先会先把所有网络IO时间处理完，然后再用相同的时间去执行任务，如果任务未执行完则直接返回。<br/>
+处理网络 IO(processSelectedKeys())<br/>
+
+**group线程组的OP_ACCEPT网络IO事件（group线程组只会处理OP_ACCEPT事件）：**
+
+获取到attachment的NioServerSocketChannel，调用其unsafe的read方法，在该方法中会调用ServerSocketChannel的accept方法得到SocketChannel，然后保存到List<Object> readBuf中（此时size=1) （group的NioEventLoop线程）<br/>
+激活NioServerSocketChannel的fireChannelRead事件，从head开始执行，消息内容是NioSocketChannel。执行ServerBootstrapAcceptor的channelRead方法，在该方法中将ServerBootstrap传入的childHandler（匿名类new ChannelInitializer<SocketChannel>）、childOptions、childAttrs用于初始化NioSocketChannel和其pipeline，同时也会向pipeline中添加一个pendingHandlerCallbackHead任务（group的NioEventLoop线程）<br/>
+最后通过childGroup去注册NioSocketChannel. 其同NioServerSocketChannel的注册过程一致，其会切换到childGroup的NioEventLoop线程中执行。（group的NioEventLoop线程）<br/>
+设置NioSocketChannel的eventLoop为childGroup中选出的NioEventLoop (group的NioEventLoop线程)<br/>
+初始化childGroup的NioEventLoop线程，并添加注册任务 （group的NioEventLoop线程）<br/>
+继续看group线程的执行从head开始执行fireChannelReadComplete事件，会调用NioServerSocketChannel的read方法，会最终调用HeadContext的beginRead方法，最终向NioServerSocketChannel设置OP_ACCEPT兴趣，所以可以看出NioServerSocketChannel的selector只会处理OP_ACCEPT事件（group的NioEventLoop线程） 到此处group线程的分析已经完成
+
+**childGroup线程组的NioSocketChannel注册过程：**
+
+childGroup的NioEventLoop进行注册，因为初始化NioEventLoop都会初始化一个seletor对象，因此此处将NioSocketChannel注册到的selector和group线程不是同一，从而实现了selectKey的分开。一个group线程的selector,  多个work线程的selector. 数量初始化时决定。主线程的selector只会处理NioServerSocketChannel的OP_ACCEPT事件，而每个work线程则可能会处理多个NioServerSocket的OP_READ|OP_WRITE事件。  （childGroup线程-注册过程）
+invokeHandlerAddedIfNeeded事件：此时会拿出pipeline中保存的pendingHandlerCallbackHead进行执行（什么时候保存的？在第一次执行pipeline.addList的时候都会初始化一个这个方法，用户后续调用ChannelInitializer的initChannel方法），此时会将ServerBootstramp.childHandler中的ChannelInitializer的initChannel方法执行，然后向NioSocketChannel的pipeline中加入用户定义的handle，然后删除该ChannelInitializer. 最后NioSocketChannel的pipeline变化为 HeadContext->ChannelInitializer->TailContext 转为HeadContext->用户handle1->用户handle m ->TailContext  （childGroup线程-注册过程）
+发送channelRegister事件，如之前NioServerSocketChannel最后在read事件中会将OP_READ设置到selector。
+
+**childGroup线程组的NioSocketChannel网络OP_READ事件：**
+
+获取到attachment的NioSocketChannel，调用其unsafe的read方法（注意这里不是NioServerSocketChannel所以读取出来的内容是数据不是NioServerSocketChannel），激活pipeline的fireChannelRead事件，经过用户自定义的Decoder、IdleStateHandler、LoginAuthRespHandler、HeartBeatRespHandler等用户自定义的handle，然后在HeartBeatRespHandler中需要writeAndFlush，然后会激活pipeline的write方法调用，其调用顺序和加入pipeline的顺序有关，其是从需要写入的地方往前找OutboundContext进行处理，如此处是从HeartBeatRespHandler发起的write事件，而最近的是IdleStateHandler、Encoder、HeadContext，最后在HeadContext的通过unsafe.write方法写入到NioSocketChannel的Buffer中。然后在flush方法最后会通过NioSocketChannel中的原生SocketChannel将数据写入。但是会有个OP_WRITE事件的判断，表示如果有任务正在写入中，则该写入操作会被pending.
+从此过程中可以看出服务器端的只会有OP_READ事件，不会有OP_WRITE事件，因此write是通过原生SocketChannel直接写出的。那是否是代码中的OP_WRITE是多余的？同时在写测试demo的时候你也发现的确从来没有进入到OP_WRITE这个分支里，那你就肯定的说netty作者真傻B，那对不起傻B的不是作者而是你。
+
+**childGroup线程组的NioSocketChannel网络OP_WRITE事件:**
+
+我们先回答下再写测试Demo的时候为什么没有进入OP_WRITE的分支，同时前面分析了一把把拉拉大堆的也没有发现注册OP_WRITE interestOps的地方？答：没有进入OP_WRITE的分支分支是由于测试demo数据量太少，并且单机测试不存在网络问题，因此NioSocketChannel一直是可写状态，因此不会进入到注册OP_WRITE事件的地方
+@Override
+protected void doWrite(ChannelOutboundBuffer in) throws Exception {
+    SocketChannel ch = javaChannel();
+    int writeSpinCount = config().getWriteSpinCount();
+    do {
+        if (in.isEmpty()) {
+            // All written so clear OP_WRITE
+            clearOpWrite();
+            // Directly return here so incompleteWrite(...) is not called.
+            return;
+        }
+
+        // Ensure the pending writes are made of ByteBufs only.
+        int maxBytesPerGatheringWrite = ((NioSocketChannelConfig) config).getMaxBytesPerGatheringWrite();
+        ByteBuffer[] nioBuffers = in.nioBuffers(1024, maxBytesPerGatheringWrite);
+        int nioBufferCnt = in.nioBufferCount();
+
+        // Always us nioBuffers() to workaround data-corruption.
+        // See https://github.com/netty/netty/issues/2761
+        switch (nioBufferCnt) {
+            case 0:
+                // We have something else beside ByteBuffers to write so fallback to normal writes.
+                writeSpinCount -= doWrite0(in);
+                break;
+            case 1: {
+                // Only one ByteBuf so use non-gathering write
+                // Zero length buffers are not added to nioBuffers by ChannelOutboundBuffer, so there is no need
+                // to check if the total size of all the buffers is non-zero.
+                ByteBuffer buffer = nioBuffers[0];
+                int attemptedBytes = buffer.remaining();
+                final int localWrittenBytes = ch.write(buffer);
+                if (localWrittenBytes <= 0) {
+                    incompleteWrite(true);
+                    return;
+                }
+                adjustMaxBytesPerGatheringWrite(attemptedBytes, localWrittenBytes, maxBytesPerGatheringWrite);
+                in.removeBytes(localWrittenBytes);
+                --writeSpinCount;
+                break;
+            }
+            default: {
+                // Zero length buffers are not added to nioBuffers by ChannelOutboundBuffer, so there is no need
+                // to check if the total size of all the buffers is non-zero.
+                // We limit the max amount to int above so cast is safe
+                long attemptedBytes = in.nioBufferSize();
+                final long localWrittenBytes = ch.write(nioBuffers, 0, nioBufferCnt);
+                if (localWrittenBytes <= 0) {
+                    incompleteWrite(true);
+                    return;
+                }
+                // Casting to int is safe because we limit the total amount of data in the nioBuffers to int above.
+                adjustMaxBytesPerGatheringWrite((int) attemptedBytes, (int) localWrittenBytes,
+                        maxBytesPerGatheringWrite);
+                in.removeBytes(localWrittenBytes);
+                --writeSpinCount;
+                break;
+            }
+        }
+    } while (writeSpinCount > 0);
+
+    incompleteWrite(writeSpinCount < 0);
+}
+
+
+我们看如上一段代码当writeSpinCount<0的时候或者localWrittenBytes <= 0的时候都会进入到incompleteWrite的逻辑中，而该逻辑就只做一件事key.interestOps(interestOps | SelectionKey.OP_WRITE); 将OP_WRITE事件加入。那什么时候writeSpinCount回小于0呢，其实就是如果buffer被发送了16次都还有剩余或者通道繁忙没有写入空间的时候，因为我们知道ip包长度时候限制的，因此如果数据量过多，写入请求过多就会导致一次写不完的情况。
+而NioEventLoop中OP_WRITE就是调用了 ch.unsafe().forceFlush();继续将缓冲区内的数据写入到NioSocketChannel。导这里服务端的netty就分析完成了，客户端因为只有一个NioEventLoopGroup然后流程又基本一致就不进行分析了。
+
+
