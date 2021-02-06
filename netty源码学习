@@ -154,4 +154,6 @@ protected void doWrite(ChannelOutboundBuffer in) throws Exception {
 我们看如上一段代码当writeSpinCount<0的时候或者localWrittenBytes <= 0的时候都会进入到incompleteWrite的逻辑中，而该逻辑就只做一件事key.interestOps(interestOps | SelectionKey.OP_WRITE); 将OP_WRITE事件加入。那什么时候writeSpinCount回小于0呢，其实就是如果buffer被发送了16次都还有剩余或者通道繁忙没有写入空间的时候，因为我们知道ip包长度时候限制的，因此如果数据量过多，写入请求过多就会导致一次写不完的情况。
 而NioEventLoop中OP_WRITE就是调用了 ch.unsafe().forceFlush();继续将缓冲区内的数据写入到NioSocketChannel。导这里服务端的netty就分析完成了，客户端因为只有一个NioEventLoopGroup然后流程又基本一致就不进行分析了。
 
+对于netty的一些重要组件后续有时间可能会分析下
+
 
